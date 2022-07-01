@@ -10,13 +10,15 @@ import torch.nn as nn
 import torch
 import torchvision.utils as vutils
 from IPython.display import HTML
+from torchviz import make_dot, make_dot_from_trace
+from graphviz import Source
 
 # Root directory for dataset
 
 os.makedirs("images", exist_ok=True)
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--n_epochs", type=int, default=100, help="number of epochs of training")
+parser.add_argument("--n_epochs", type=int, default=1, help="number of epochs of training")
 parser.add_argument("--batch_size", type=int, default=100, help="size of the batches")
 parser.add_argument("--lr", type=float, default=0.0002, help="adam: learning rate")
 parser.add_argument("--b1", type=float, default=0.5, help="adam: decay of first order momentum of gradient")
@@ -27,12 +29,11 @@ parser.add_argument("--img_size", type=int, default=80, help="size of each image
 parser.add_argument("--channels", type=int, default=3, help="number of image channels")
 parser.add_argument("--sample_interval", type=int, default=100, help="interval between image sampling")
 parser.add_argument("--ngpu", type=int, default=1, help="number of used GPU")
-parser.add_argument("--load_dataset", type=int, default=0, help="0 if you want to load CSV sample files, 1 if you already did it")
+parser.add_argument("--load_dataset", type=int, default=1, help="0 if you want to load CSV sample files, 1 if you already did it")
 opt = parser.parse_args()
 print(opt)
 
 cuda = True if torch.cuda.is_available() else False
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class Gestures():
 
@@ -174,11 +175,6 @@ class Generator(nn.Module):
         gst = self.conv_blocks(out)
         return gst
 
-
-neurons_num = 32
-frame_parameters = 3
-class_number = 12
-
 class Discriminator(nn.Module):
     def __init__(self):
         super(Discriminator, self).__init__()
@@ -206,8 +202,6 @@ class Discriminator(nn.Module):
         validity = self.adv_layer(out)
 
         return validity
-
-
 
 def weights_init_normal(m):
     classname = m.__class__.__name__
@@ -257,7 +251,7 @@ def main():
     torch.manual_seed(manualSeed)
 
     # Loss function
-    criterion = torch.nn.BCELoss()
+    adversarial_loss = torch.nn.BCELoss()
 
     # Initialize generator and discriminator
     generator = Generator()
@@ -265,10 +259,17 @@ def main():
     print(generator)
     print(discriminator)
 
+    torch.save(generator, "gen.pth")
+    torch.save(discriminator, "disc.pth")
+
+    x = torch.randn(100, 100)
+    y = generator(x)
+    model_arch = make_dot(y.mean(), params=dict(generator.named_parameters()))
+    Source(model_arch).render("graph.jpg")
     if cuda:
         generator.cuda().to(device)
         discriminator.cuda().to(device)
-        criterion.cuda().to(device)
+        adversarial_loss.cuda().to(device)
 
     # Initialize weights
     generator.apply(weights_init_normal)
@@ -307,50 +308,49 @@ def main():
         for i, gesture in enumerate(dataloader):
 
             # Label 1 for real gestures and 0 for fake
+
             valid = Variable(Tensor(gesture.shape[0], 1).fill_(1.0).to(device), requires_grad=False)
             fake = Variable(Tensor(gesture.shape[0], 1).fill_(0.0).to(device), requires_grad=False)
 
             # Configure input
             real_sample = Variable(gesture.type(Tensor)).to(device)
 
-            #Discriminator training
-            discriminator.zero_grad()
-            output = discriminator(real_sample)
+            # Train generator
 
-            #Calculate discriminator loss for real samples
-            D_real_loss = criterion(output, valid)
-            D_real_loss.backward(retain_graph=True)
+            optimizer_G.zero_grad()
 
-            D_x = output.mean().item()
-
-            # Generator training
             # Sample noise as generator input
             z = Variable(Tensor(np.random.normal(0, 1, (gesture.shape[0], opt.latent_dim))).to(device))
-
             # Generate a batch of images
             gen_sample = generator(z)
 
             # Loss measures generator's ability to fool the discriminator
-            D_fake_loss = criterion(discriminator(gen_sample), fake)
+            g_loss = adversarial_loss(discriminator(gen_sample), valid)
 
-            D_fake_loss.backward(retain_graph=True)
-            D_loss = D_real_loss + D_fake_loss
-            optimizer_D.step()
-
-            #Update
-            generator.zero_grad()
-            G_loss = criterion(discriminator(gen_sample), valid)
-            G_loss.backward(retain_graph=True)
+            g_loss.backward()
             optimizer_G.step()
 
+            # Train discriminator
+
+            optimizer_D.zero_grad()
+
+            # Measure discriminator's ability to classify real from generated samples
+            output = discriminator(real_sample)
+            real_loss = adversarial_loss(output, valid)
+            D_x = output.mean().item()
+            fake_loss = adversarial_loss(discriminator(gen_sample.detach()), fake)
+            d_loss = (real_loss + fake_loss)
+
+            d_loss.backward()
+            optimizer_D.step()
 
             # Print loss
             if i % 100 == 0:
                 print(
                     "[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f] [D(x): %.4f]"
-                    % (epoch, opt.n_epochs, i, len(dataloader), D_loss.item(), D_fake_loss.item(), D_x))
-            G_losses.append(D_fake_loss.item())
-            D_losses.append(D_loss.item())
+                    % (epoch, opt.n_epochs, i, len(dataloader), d_loss.item(), g_loss.item(), D_x))
+            G_losses.append(g_loss.item())
+            D_losses.append(d_loss.item())
 
             batches_done = epoch * len(dataloader) + i
             # Save images
